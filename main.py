@@ -7,15 +7,23 @@ import logging
 import json
 import requests
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- 配置 ---
-# 定义异常阈值
-THRESHOLD_DOLLAR = 50.0
-THRESHOLD_PERCENT = 25.0
-THRESHOLD_PERCENT_MIN_COST = 10.0 # 忽略从 $0.1 -> $0.2 这种增长
+# 定义异常阈值 (从环境变量读取，未配置时使用默认值)
+THRESHOLD_DOLLAR = float(os.environ.get('THRESHOLD_DOLLAR', '50.0'))
+THRESHOLD_PERCENT = float(os.environ.get('THRESHOLD_PERCENT', '25.0'))
+THRESHOLD_PERCENT_MIN_COST = float(os.environ.get('THRESHOLD_PERCENT_MIN_COST', '10.0'))
 
-# 飞书 Webhook URL (从环境变量读取)
+# 货币符号 (从环境变量读取，默认为 $)
+CURRENCY_SYMBOL = os.environ.get('CURRENCY_SYMBOL', '$')
+
+# Notification Webhook URLs (从环境变量读取)
 FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
+MATTERMOST_WEBHOOK_URL = os.environ.get('MATTERMOST_WEBHOOK_URL', '')
 
 # 日志配置
 LOG_DIR = Path(__file__).parent / 'logs'
@@ -46,7 +54,7 @@ def send_feishu_notification(title, content, color="green"):
         bool: True if sent successfully, False otherwise
     """
     if not FEISHU_WEBHOOK_URL:
-        logger.warning("FEISHU_WEBHOOK_URL not configured, skipping notification")
+        logger.debug("FEISHU_WEBHOOK_URL not configured, skipping Feishu notification")
         return False
     
     # Feishu card message template
@@ -94,6 +102,91 @@ def send_feishu_notification(title, content, color="green"):
     except Exception as e:
         logger.error(f"Failed to send Feishu notification: {e}", exc_info=True)
         return False
+
+def send_mattermost_notification(title, content, color="good"):
+    """Send notification to Mattermost via webhook
+    
+    Args:
+        title: Message title
+        content: Message content (markdown supported)
+        color: Attachment color - "good" for normal, "danger" for error, "warning" for warning
+    
+    Returns:
+        bool: True if sent successfully, False otherwise
+    """
+    if not MATTERMOST_WEBHOOK_URL:
+        logger.debug("MATTERMOST_WEBHOOK_URL not configured, skipping Mattermost notification")
+        return False
+    
+    # Map color names
+    color_map = {
+        "green": "good",
+        "red": "danger",
+        "orange": "warning"
+    }
+    mattermost_color = color_map.get(color, color)
+    
+    # Mattermost message payload
+    payload = {
+        "username": "AWS Bill Checker",
+        "icon_emoji": ":chart_with_upwards_trend:",
+        "attachments": [
+            {
+                "color": mattermost_color,
+                "title": title,
+                "text": content,
+                "mrkdwn_in": ["text"]
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(
+            MATTERMOST_WEBHOOK_URL,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        if response.status_code == 200:
+            logger.info("Mattermost notification sent successfully")
+            return True
+        else:
+            logger.error(f"Mattermost notification failed: {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to send Mattermost notification: {e}", exc_info=True)
+        return False
+
+def send_notification(title, content, color="green"):
+    """Send notification to configured platforms (Feishu and/or Mattermost)
+    
+    Args:
+        title: Message title
+        content: Message content
+        color: Color indicator - "green" for normal, "red" for error, "orange" for warning
+    
+    Returns:
+        bool: True if at least one notification was sent successfully
+    """
+    if not FEISHU_WEBHOOK_URL and not MATTERMOST_WEBHOOK_URL:
+        logger.warning("No notification webhook configured (FEISHU_WEBHOOK_URL or MATTERMOST_WEBHOOK_URL)")
+        return False
+    
+    success = False
+    
+    # Send to Feishu if configured
+    if FEISHU_WEBHOOK_URL:
+        if send_feishu_notification(title, content, color):
+            success = True
+    
+    # Send to Mattermost if configured
+    if MATTERMOST_WEBHOOK_URL:
+        if send_mattermost_notification(title, content, color):
+            success = True
+    
+    return success
 
 def get_monthly_costs(start_date, end_date):
     """使用 Cost Explorer API 查询指定时间段内按服务分类的成本"""
@@ -161,7 +254,7 @@ def main():
     if prev_month_data is None:
         error_msg = f"Failed to retrieve AWS bill data for {prev_month_name}"
         logger.error(error_msg)
-        send_feishu_notification(
+        send_notification(
             title="❌ AWS 账单检查失败",
             content=f"**错误**: 无法获取 {prev_month_name} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)",
             color="red"
@@ -175,7 +268,7 @@ def main():
     if last_month_data is None:
         error_msg = f"Failed to retrieve AWS bill data for {last_month_name}"
         logger.error(error_msg)
-        send_feishu_notification(
+        send_notification(
             title="❌ AWS 账单检查失败",
             content=f"**错误**: 无法获取 {last_month_name} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)",
             color="red"
@@ -184,7 +277,7 @@ def main():
 
     if not prev_costs and not last_costs:
         logger.warning("No bill data retrieved for both months")
-        send_feishu_notification(
+        send_notification(
             title="⚠️ AWS 账单检查警告",
             content="未能获取到任何账单数据",
             color="orange"
@@ -255,29 +348,28 @@ def main():
         for anomaly in anomalies:
             logger.warning(f"  - {anomaly['service']}: ${anomaly['diff']:,.2f} ({anomaly['percent']:.2f}%)")
         
-        # 构建飞书消息内容
+        # 构建通知消息内容
         content_lines = [
             f"📊 **账单周期**: {prev_month_name} vs {last_month_name}",
             "",
             f"**💰 总费用**",
-            f"- {prev_month_name}: ${total_prev:,.2f}",
-            f"- {last_month_name}: ${total_last:,.2f}",
-            f"- 变化: ${total_diff:,.2f} ({total_percent:+.2f}%)",
+            f"- {prev_month_name}: {CURRENCY_SYMBOL}{total_prev:,.2f}",
+            f"- {last_month_name}: {CURRENCY_SYMBOL}{total_last:,.2f}",
+            f"- 变化: {CURRENCY_SYMBOL}{total_diff:,.2f} ({total_percent:+.2f}%)",
             "",
-            f"**⚠️ 发现 {len(anomalies)} 个异常项** (阈值: ${THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%):",
-            ""
+            f"**⚠️ 发现 {len(anomalies)} 个异常项** (阈值: {CURRENCY_SYMBOL}{THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%):",
         ]
         
         for anomaly in anomalies:
             content_lines.append(
                 f"🔸 **{anomaly['service']}**\n"
-                f"   - {prev_month_name}: ${anomaly['prev']:,.2f}\n"
-                f"   - {last_month_name}: ${anomaly['last']:,.2f}\n"
-                f"   - 变化: ${anomaly['diff']:+,.2f} ({anomaly['percent']:+.2f}%)"
+                f"   - {prev_month_name}: {CURRENCY_SYMBOL}{anomaly['prev']:,.2f}\n"
+                f"   - {last_month_name}: {CURRENCY_SYMBOL}{anomaly['last']:,.2f}\n"
+                f"   - 变化: {CURRENCY_SYMBOL}{anomaly['diff']:+,.2f} ({anomaly['percent']:+.2f}%)"
             )
         
-        send_feishu_notification(
-            title="⚠️ AWS 账单检查 - 发现异常",
+        send_notification(
+            title="⚠️ AWS 账单检查: 发现异常",
             content="\n".join(content_lines),
             color="orange"
         )
@@ -289,16 +381,16 @@ def main():
             f"📊 **账单周期**: {prev_month_name} vs {last_month_name}",
             "",
             f"**💰 总费用**",
-            f"- {prev_month_name}: ${total_prev:,.2f}",
-            f"- {last_month_name}: ${total_last:,.2f}",
-            f"- 变化: ${total_diff:,.2f} ({total_percent:+.2f}%)",
+            f"- {prev_month_name}: {CURRENCY_SYMBOL}{total_prev:,.2f}",
+            f"- {last_month_name}: {CURRENCY_SYMBOL}{total_last:,.2f}",
+            f"- 变化: {CURRENCY_SYMBOL}{total_diff:,.2f} ({total_percent:+.2f}%)",
             "",
             f"✅ **未发现明显异常增长的服务**",
-            f"   (阈值: ${THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%)"
+            f"   (阈值: {CURRENCY_SYMBOL}{THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%)"
         ]
         
-        send_feishu_notification(
-            title="✅ AWS 账单检查 - 一切正常",
+        send_notification(
+            title="✅ AWS 账单检查: 一切正常",
             content="\n".join(content_lines),
             color="green"
         )
