@@ -115,6 +115,9 @@ THRESHOLD_PERCENT_MIN_COST=10.0   # 百分比阈值的最小金额 (默认: 10.0
 
 # 货币符号
 CURRENCY_SYMBOL=$                  # 通知中显示的货币符号 (默认: $，可选: ￥, €, £ 等)
+
+# 语言设置
+LANGUAGE=CN                        # 通知语言 (默认: CN，可选: CN, EN)
 ```
 
 #### 获取 Webhook URL
@@ -161,6 +164,26 @@ CURRENCY_SYMBOL=$                  # 通知中显示的货币符号 (默认: $�
 - 可以同时配置飞书和 Mattermost，两个渠道都会收到通知
 - 也可以只配置其中一个
 - 如果都不配置，脚本会记录警告日志但仍会执行账单检查
+
+### 语言设置
+
+支持两种语言的通知：
+
+- **CN (中文)**: 默认语言，适合中文用户
+- **EN (英文)**: 适合国际团队或英文环境
+
+语言设置会影响所有通知消息的标题和内容，包括：
+- 错误消息
+- 警告消息  
+- 正常/异常状态通知
+- 账单对比报告
+
+**示例对比**:
+
+| 语言 | 正常通知标题 | 异常通知标题 |
+|------|-------------|-------------|
+| CN   | ✅ AWS 账单检查: 一切正常 | ⚠️ AWS 账单检查: 发现异常 |
+| EN   | ✅ AWS Bill Check: All Normal | ⚠️ AWS Bill Check: Anomalies Detected |
 
 ## Setup Cron Job
 
@@ -242,14 +265,16 @@ tail -f logs/aws_bill_checker_*.log
 
 ## Notification Format
 
-通知支持飞书和 Mattermost 两种平台，格式会根据平台自动调整。
+通知支持飞书和 Mattermost 两种平台，格式会根据平台自动调整。语言和货币符号会根据 `.env` 配置显示。
 
-### 正常情况
+### 中文通知 (LANGUAGE=CN)
+
+#### 正常情况
 
 **飞书**（绿色卡片）/ **Mattermost**（绿色边框）:
 
 ```
-✅ AWS 账单检查 - 一切正常
+✅ AWS 账单检查: 一切正常
 ━━━━━━━━━━━━━━━━━━━━━━━
 📊 账单周期: 2025-08 vs 2025-09
 
@@ -262,12 +287,12 @@ tail -f logs/aws_bill_checker_*.log
    (阈值: $50 或 25%)
 ```
 
-### 异常情况
+#### 异常情况
 
 **飞书**（橙色卡片）/ **Mattermost**（橙色边框）:
 
 ```
-⚠️ AWS 账单检查 - 发现异常
+⚠️ AWS 账单检查: 发现异常
 ━━━━━━━━━━━━━━━━━━━━━━━
 📊 账单周期: 2025-08 vs 2025-09
 
@@ -289,7 +314,56 @@ tail -f logs/aws_bill_checker_*.log
    - 变化: +$80.00 (+80.00%)
 ```
 
-**注意**: 货币符号会根据 `.env` 文件中的 `CURRENCY_SYMBOL` 配置显示。
+### 英文通知 (LANGUAGE=EN)
+
+#### 正常情况
+
+**Feishu** (Green Card) / **Mattermost** (Green Border):
+
+```
+✅ AWS Bill Check: All Normal
+━━━━━━━━━━━━━━━━━━━━━━━
+📊 Billing Period: 2025-08 vs 2025-09
+
+💰 Total Cost
+- 2025-08: $1,234.56
+- 2025-09: $1,198.23
+- Change: -$36.33 (-2.94%)
+
+✅ No significant cost increases detected
+   (threshold: $50 or 25%)
+```
+
+#### 异常情况
+
+**Feishu** (Orange Card) / **Mattermost** (Orange Border):
+
+```
+⚠️ AWS Bill Check: Anomalies Detected
+━━━━━━━━━━━━━━━━━━━━━━━
+📊 Billing Period: 2025-08 vs 2025-09
+
+💰 Total Cost
+- 2025-08: $1,234.56
+- 2025-09: $1,567.89
+- Change: +$333.33 (+27.00%)
+
+⚠️ Found 2 anomaly/anomalies (threshold: $50 or 25%):
+
+🔸 Amazon EC2
+   - 2025-08: $500.00
+   - 2025-09: $750.00
+   - Change: +$250.00 (+50.00%)
+
+🔸 Amazon S3
+   - 2025-08: $100.00
+   - 2025-09: $180.00
+   - Change: +$80.00 (+80.00%)
+```
+
+**注意**: 
+- 货币符号会根据 `.env` 文件中的 `CURRENCY_SYMBOL` 配置显示
+- 语言会根据 `.env` 文件中的 `LANGUAGE` 配置显示
 
 ## Troubleshooting
 

@@ -21,6 +21,9 @@ THRESHOLD_PERCENT_MIN_COST = float(os.environ.get('THRESHOLD_PERCENT_MIN_COST', 
 # 货币符号 (从环境变量读取，默认为 $)
 CURRENCY_SYMBOL = os.environ.get('CURRENCY_SYMBOL', '$')
 
+# 语言设置 (从环境变量读取，默认为 CN)
+LANGUAGE = os.environ.get('LANGUAGE', 'CN').upper()
+
 # Notification Webhook URLs (从环境变量读取)
 FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
 MATTERMOST_WEBHOOK_URL = os.environ.get('MATTERMOST_WEBHOOK_URL', '')
@@ -40,6 +43,46 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# 语言字符串定义
+LANG_STRINGS = {
+    'CN': {
+        'error_title': '❌ AWS 账单检查失败',
+        'error_content': '**错误**: 无法获取 {month} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)',
+        'warning_title': '⚠️ AWS 账单检查警告',
+        'warning_content': '未能获取到任何账单数据',
+        'anomaly_title': '⚠️ AWS 账单检查: 发现异常',
+        'normal_title': '✅ AWS 账单检查: 一切正常',
+        'bill_period': '📊 **账单周期**: {prev_month} vs {last_month}',
+        'total_cost': '**💰 总费用**',
+        'change': '变化',
+        'anomalies_found': '**⚠️ 发现 {count} 个异常项** (阈值: {currency}{threshold_dollar} 或 {threshold_percent}%):',
+        'no_anomalies': '✅ **未发现明显异常增长的服务**',
+        'threshold_info': '   (阈值: {currency}{threshold_dollar} 或 {threshold_percent}%)',
+        'service_change': '   - 变化: {currency}{diff:+,.2f} ({percent:+.2f}%)'
+    },
+    'EN': {
+        'error_title': '❌ AWS Bill Check Failed',
+        'error_content': '**Error**: Failed to retrieve bill data for {month}\n\nPlease check AWS credentials and IAM permissions (requires ce:GetCostAndUsage)',
+        'warning_title': '⚠️ AWS Bill Check Warning',
+        'warning_content': 'No bill data retrieved for both months',
+        'anomaly_title': '⚠️ AWS Bill Check: Anomalies Detected',
+        'normal_title': '✅ AWS Bill Check: All Normal',
+        'bill_period': '📊 **Billing Period**: {prev_month} vs {last_month}',
+        'total_cost': '**💰 Total Cost**',
+        'change': 'Change',
+        'anomalies_found': '**⚠️ Found {count} anomaly/anomalies** (threshold: {currency}{threshold_dollar} or {threshold_percent}%):',
+        'no_anomalies': '✅ **No significant cost increases detected**',
+        'threshold_info': '   (threshold: {currency}{threshold_dollar} or {threshold_percent}%)',
+        'service_change': '   - Change: {currency}{diff:+,.2f} ({percent:+.2f}%)'
+    }
+}
+
+# 获取当前语言的字符串
+def get_text(key, **kwargs):
+    """Get localized text string"""
+    return LANG_STRINGS.get(LANGUAGE, LANG_STRINGS['CN'])[key].format(**kwargs)
+
 # -------------
 
 def send_feishu_notification(title, content, color="green"):
@@ -255,8 +298,8 @@ def main():
         error_msg = f"Failed to retrieve AWS bill data for {prev_month_name}"
         logger.error(error_msg)
         send_notification(
-            title="❌ AWS 账单检查失败",
-            content=f"**错误**: 无法获取 {prev_month_name} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)",
+            title=get_text('error_title'),
+            content=get_text('error_content', month=prev_month_name),
             color="red"
         )
         return
@@ -269,8 +312,8 @@ def main():
         error_msg = f"Failed to retrieve AWS bill data for {last_month_name}"
         logger.error(error_msg)
         send_notification(
-            title="❌ AWS 账单检查失败",
-            content=f"**错误**: 无法获取 {last_month_name} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)",
+            title=get_text('error_title'),
+            content=get_text('error_content', month=last_month_name),
             color="red"
         )
         return
@@ -278,8 +321,8 @@ def main():
     if not prev_costs and not last_costs:
         logger.warning("No bill data retrieved for both months")
         send_notification(
-            title="⚠️ AWS 账单检查警告",
-            content="未能获取到任何账单数据",
+            title=get_text('warning_title'),
+            content=get_text('warning_content'),
             color="orange"
         )
         return
@@ -350,14 +393,14 @@ def main():
         
         # 构建通知消息内容
         content_lines = [
-            f"📊 **账单周期**: {prev_month_name} vs {last_month_name}",
+            get_text('bill_period', prev_month=prev_month_name, last_month=last_month_name),
             "",
-            f"**💰 总费用**",
+            get_text('total_cost'),
             f"- {prev_month_name}: {CURRENCY_SYMBOL}{total_prev:,.2f}",
             f"- {last_month_name}: {CURRENCY_SYMBOL}{total_last:,.2f}",
-            f"- 变化: {CURRENCY_SYMBOL}{total_diff:,.2f} ({total_percent:+.2f}%)",
+            f"- {get_text('change')}: {CURRENCY_SYMBOL}{total_diff:,.2f} ({total_percent:+.2f}%)",
             "",
-            f"**⚠️ 发现 {len(anomalies)} 个异常项** (阈值: {CURRENCY_SYMBOL}{THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%):",
+            get_text('anomalies_found', count=len(anomalies), currency=CURRENCY_SYMBOL, threshold_dollar=THRESHOLD_DOLLAR, threshold_percent=THRESHOLD_PERCENT),
         ]
         
         for anomaly in anomalies:
@@ -365,11 +408,11 @@ def main():
                 f"🔸 **{anomaly['service']}**\n"
                 f"   - {prev_month_name}: {CURRENCY_SYMBOL}{anomaly['prev']:,.2f}\n"
                 f"   - {last_month_name}: {CURRENCY_SYMBOL}{anomaly['last']:,.2f}\n"
-                f"   - 变化: {CURRENCY_SYMBOL}{anomaly['diff']:+,.2f} ({anomaly['percent']:+.2f}%)"
+                f"{get_text('service_change', currency=CURRENCY_SYMBOL, diff=anomaly['diff'], percent=anomaly['percent'])}"
             )
         
         send_notification(
-            title="⚠️ AWS 账单检查: 发现异常",
+            title=get_text('anomaly_title'),
             content="\n".join(content_lines),
             color="orange"
         )
@@ -378,19 +421,19 @@ def main():
         logger.info("No anomalies detected")
         
         content_lines = [
-            f"📊 **账单周期**: {prev_month_name} vs {last_month_name}",
+            get_text('bill_period', prev_month=prev_month_name, last_month=last_month_name),
             "",
-            f"**💰 总费用**",
+            get_text('total_cost'),
             f"- {prev_month_name}: {CURRENCY_SYMBOL}{total_prev:,.2f}",
             f"- {last_month_name}: {CURRENCY_SYMBOL}{total_last:,.2f}",
-            f"- 变化: {CURRENCY_SYMBOL}{total_diff:,.2f} ({total_percent:+.2f}%)",
+            f"- {get_text('change')}: {CURRENCY_SYMBOL}{total_diff:,.2f} ({total_percent:+.2f}%)",
             "",
-            f"✅ **未发现明显异常增长的服务**",
-            f"   (阈值: {CURRENCY_SYMBOL}{THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%)"
+            get_text('no_anomalies'),
+            get_text('threshold_info', currency=CURRENCY_SYMBOL, threshold_dollar=THRESHOLD_DOLLAR, threshold_percent=THRESHOLD_PERCENT)
         ]
         
         send_notification(
-            title="✅ AWS 账单检查: 一切正常",
+            title=get_text('normal_title'),
             content="\n".join(content_lines),
             color="green"
         )
