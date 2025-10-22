@@ -1,0 +1,310 @@
+import boto3
+import datetime
+from dateutil.relativedelta import relativedelta
+import sys
+import os
+import logging
+import json
+import requests
+from pathlib import Path
+
+# --- 配置 ---
+# 定义异常阈值
+THRESHOLD_DOLLAR = 50.0
+THRESHOLD_PERCENT = 25.0
+THRESHOLD_PERCENT_MIN_COST = 10.0 # 忽略从 $0.1 -> $0.2 这种增长
+
+# 飞书 Webhook URL (从环境变量读取)
+FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
+
+# 日志配置
+LOG_DIR = Path(__file__).parent / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / f"aws_bill_checker_{datetime.date.today().strftime('%Y%m')}.log"
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+# -------------
+
+def send_feishu_notification(title, content, color="green"):
+    """Send notification to Feishu via webhook using card message
+    
+    Args:
+        title: Message title
+        content: Message content (can include markdown)
+        color: Card color - "green" for normal, "red" for error, "orange" for warning
+    
+    Returns:
+        bool: True if sent successfully, False otherwise
+    """
+    if not FEISHU_WEBHOOK_URL:
+        logger.warning("FEISHU_WEBHOOK_URL not configured, skipping notification")
+        return False
+    
+    # Feishu card message template
+    card = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {
+                "wide_screen_mode": True
+            },
+            "header": {
+                "title": {
+                    "content": title,
+                    "tag": "plain_text"
+                },
+                "template": color
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "content": content,
+                        "tag": "lark_md"
+                    }
+                }
+            ]
+        }
+    }
+    
+    try:
+        response = requests.post(
+            FEISHU_WEBHOOK_URL,
+            json=card,
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        if result.get('StatusCode') == 0 or result.get('code') == 0:
+            logger.info("Feishu notification sent successfully")
+            return True
+        else:
+            logger.error(f"Feishu notification failed: {result}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to send Feishu notification: {e}", exc_info=True)
+        return False
+
+def get_monthly_costs(start_date, end_date):
+    """使用 Cost Explorer API 查询指定时间段内按服务分类的成本"""
+    client = boto3.client('ce')
+    try:
+        response = client.get_cost_and_usage(
+            TimePeriod={
+                'Start': start_date,
+                'End': end_date
+            },
+            Granularity='MONTHLY',
+            Metrics=['UnblendedCost'],
+            GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}]
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Failed to call AWS Cost Explorer API: {e}", exc_info=True)
+        return None
+
+def parse_costs_to_dict(response):
+    """将 Cost Explorer 的 API 响应解析为 {服务名: 金额} 的字典"""
+    costs = {}
+    if not response or not response.get('ResultsByTime'):
+        return costs
+
+    # API 可能返回空组，即使有总成本
+    groups = response['ResultsByTime'][0].get('Groups', [])
+    for group in groups:
+        service_name = group['Keys'][0]
+        cost = float(group['Metrics']['UnblendedCost']['Amount'])
+        costs[service_name] = cost
+    return costs
+
+def main():
+    logger.info("=" * 80)
+    logger.info("AWS Bill Checker started")
+    logger.info("=" * 80)
+    
+    # 1. 计算日期
+    today = datetime.date.today()
+    # 上个月的结束日期 (即本月第一天)
+    last_month_end_dt = today.replace(day=1)
+    # 上个月的开始日期
+    last_month_start_dt = last_month_end_dt - relativedelta(months=1)
+    # 上上个月的开始日期
+    prev_month_start_dt = last_month_end_dt - relativedelta(months=2)
+
+    # 格式化为 YYYY-MM-DD 字符串
+    last_month_start = last_month_start_dt.strftime('%Y-%m-%d')
+    last_month_end = last_month_end_dt.strftime('%Y-%m-%d')
+    prev_month_start = prev_month_start_dt.strftime('%Y-%m-%d')
+    prev_month_end = last_month_start # 上上月的结束 = 上月的开始
+    
+    # 用于显示的月份名称
+    prev_month_name = prev_month_start_dt.strftime('%Y-%m')
+    last_month_name = last_month_start_dt.strftime('%Y-%m')
+
+    # 2. API 调用
+    logger.info(f"Querying AWS bills for {prev_month_name} and {last_month_name}")
+    logger.info(f"Previous month: {prev_month_start} to {prev_month_end}")
+    
+    prev_month_data = get_monthly_costs(prev_month_start, prev_month_end)
+    prev_costs = parse_costs_to_dict(prev_month_data)
+    
+    if prev_month_data is None:
+        error_msg = f"Failed to retrieve AWS bill data for {prev_month_name}"
+        logger.error(error_msg)
+        send_feishu_notification(
+            title="❌ AWS 账单检查失败",
+            content=f"**错误**: 无法获取 {prev_month_name} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)",
+            color="red"
+        )
+        return
+
+    logger.info(f"Last month: {last_month_start} to {last_month_end}")
+    last_month_data = get_monthly_costs(last_month_start, last_month_end)
+    last_costs = parse_costs_to_dict(last_month_data)
+    
+    if last_month_data is None:
+        error_msg = f"Failed to retrieve AWS bill data for {last_month_name}"
+        logger.error(error_msg)
+        send_feishu_notification(
+            title="❌ AWS 账单检查失败",
+            content=f"**错误**: 无法获取 {last_month_name} 的账单数据\n\n请检查 AWS 凭证和 IAM 权限 (需要 ce:GetCostAndUsage)",
+            color="red"
+        )
+        return
+
+    if not prev_costs and not last_costs:
+        logger.warning("No bill data retrieved for both months")
+        send_feishu_notification(
+            title="⚠️ AWS 账单检查警告",
+            content="未能获取到任何账单数据",
+            color="orange"
+        )
+        return
+
+    # 3. 数据处理和对比
+    all_services = set(prev_costs.keys()) | set(last_costs.keys())
+    report_lines = []
+    anomalies = []
+
+    total_prev = 0.0
+    total_last = 0.0
+
+    for service in sorted(list(all_services)):
+        prev = prev_costs.get(service, 0.0)
+        last = last_costs.get(service, 0.0)
+        diff = last - prev
+
+        percent = 0.0
+        if prev > 0.001: # 避免除零
+            percent = (diff / prev) * 100.0
+        elif last > 0.001:
+            percent = 100.0 # 新增服务
+
+        total_prev += prev
+        total_last += last
+
+        report_lines.append((service, prev, last, diff, percent))
+
+        # 检查异常
+        if diff > THRESHOLD_DOLLAR or (percent > THRESHOLD_PERCENT and last > THRESHOLD_PERCENT_MIN_COST):
+            anomalies.append({
+                'service': service,
+                'prev': prev,
+                'last': last,
+                'diff': diff,
+                'percent': percent
+            })
+
+    # 4. 记录详细报告到日志
+    logger.info("-" * 105)
+    logger.info(f"AWS Bill Comparison Report: {prev_month_name} vs {last_month_name}")
+    logger.info("-" * 105)
+    logger.info(f"{'Service':<45} | {'Prev Month ($)':<15} | {'Last Month ($)':<15} | {'Change ($)':<15} | {'Change (%)':<10}")
+    logger.info("-" * 105)
+
+    for line in report_lines:
+        service, prev, last, diff, percent = line
+        logger.info(f"{service:<45} | {prev:<15.2f} | {last:<15.2f} | {diff:<15.2f} | {percent:<10.2f}%")
+
+    # 计算总计
+    total_diff = total_last - total_prev
+    total_percent = 0.0
+    if total_prev > 0.001:
+        total_percent = (total_diff / total_prev) * 100.0
+    elif total_last > 0.001:
+        total_percent = 100.0
+
+    logger.info("-" * 105)
+    logger.info(f"{'TOTAL':<45} | {total_prev:<15.2f} | {total_last:<15.2f} | {total_diff:<15.2f} | {total_percent:<10.2f}%")
+    logger.info("-" * 105)
+
+    # 5. 发送飞书通知（总览 + 异常项）
+    if anomalies:
+        # 有异常情况
+        logger.warning(f"Found {len(anomalies)} anomaly/anomalies")
+        for anomaly in anomalies:
+            logger.warning(f"  - {anomaly['service']}: ${anomaly['diff']:,.2f} ({anomaly['percent']:.2f}%)")
+        
+        # 构建飞书消息内容
+        content_lines = [
+            f"📊 **账单周期**: {prev_month_name} vs {last_month_name}",
+            "",
+            f"**💰 总费用**",
+            f"- {prev_month_name}: ${total_prev:,.2f}",
+            f"- {last_month_name}: ${total_last:,.2f}",
+            f"- 变化: ${total_diff:,.2f} ({total_percent:+.2f}%)",
+            "",
+            f"**⚠️ 发现 {len(anomalies)} 个异常项** (阈值: ${THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%):",
+            ""
+        ]
+        
+        for anomaly in anomalies:
+            content_lines.append(
+                f"🔸 **{anomaly['service']}**\n"
+                f"   - {prev_month_name}: ${anomaly['prev']:,.2f}\n"
+                f"   - {last_month_name}: ${anomaly['last']:,.2f}\n"
+                f"   - 变化: ${anomaly['diff']:+,.2f} ({anomaly['percent']:+.2f}%)"
+            )
+        
+        send_feishu_notification(
+            title="⚠️ AWS 账单检查 - 发现异常",
+            content="\n".join(content_lines),
+            color="orange"
+        )
+    else:
+        # 一切正常
+        logger.info("No anomalies detected")
+        
+        content_lines = [
+            f"📊 **账单周期**: {prev_month_name} vs {last_month_name}",
+            "",
+            f"**💰 总费用**",
+            f"- {prev_month_name}: ${total_prev:,.2f}",
+            f"- {last_month_name}: ${total_last:,.2f}",
+            f"- 变化: ${total_diff:,.2f} ({total_percent:+.2f}%)",
+            "",
+            f"✅ **未发现明显异常增长的服务**",
+            f"   (阈值: ${THRESHOLD_DOLLAR} 或 {THRESHOLD_PERCENT}%)"
+        ]
+        
+        send_feishu_notification(
+            title="✅ AWS 账单检查 - 一切正常",
+            content="\n".join(content_lines),
+            color="green"
+        )
+    
+    logger.info("AWS Bill Checker completed successfully")
+    logger.info("=" * 80)
+
+if __name__ == "__main__":
+    main()
