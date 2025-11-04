@@ -8,6 +8,7 @@ import json
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
+from io import StringIO
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,10 +29,17 @@ LANGUAGE = os.environ.get('LANGUAGE', 'CN').upper()
 FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
 MATTERMOST_WEBHOOK_URL = os.environ.get('MATTERMOST_WEBHOOK_URL', '')
 
+# OpenAI API Settings (从环境变量读取)
+OPENAI_API_BASE = os.environ.get('OPENAI_API_BASE', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+
 # 日志配置
 LOG_DIR = Path(__file__).parent / 'logs'
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"aws_bill_checker_{datetime.date.today().strftime('%Y%m')}.log"
+
+# 创建一个 StringIO 对象来收集当前执行的日志
+log_stream = StringIO()
 
 # 配置日志
 logging.basicConfig(
@@ -39,7 +47,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(log_stream)  # 添加内存日志收集器
     ]
 )
 logger = logging.getLogger(__name__)
@@ -84,6 +93,108 @@ def get_text(key, **kwargs):
     return LANG_STRINGS.get(LANGUAGE, LANG_STRINGS['CN'])[key].format(**kwargs)
 
 # -------------
+
+def analyze_logs_with_ai(log_content, report_data):
+    """Use OpenAI API to analyze bill logs and provide insights
+
+    Args:
+        log_content: The collected log content from current execution
+        report_data: Dictionary containing bill comparison data
+            - prev_month_name: Previous month name (YYYY-MM)
+            - last_month_name: Last month name (YYYY-MM)
+            - total_prev: Total cost for previous month
+            - total_last: Total cost for last month
+            - anomalies: List of anomaly dictionaries
+            - all_services: List of all services with costs
+    
+    Returns:
+        str: AI analysis result, or None if API is not configured or fails
+    """
+    if not OPENAI_API_BASE or not OPENAI_API_KEY:
+        logger.debug("OpenAI API not configured, skipping AI analysis")
+        return None
+    
+    try:
+        # 导入 OpenAI 库
+        from openai import OpenAI
+        
+        # 初始化客户端
+        client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_API_BASE
+        )
+        
+        # 构建提示词
+        if LANGUAGE == 'CN':
+            system_prompt = """你是一个专业的云成本分析专家。请根据提供的 AWS 账单日志，分析账单变化情况，并提供简洁、有价值的见解。
+
+要求：
+1. 重点关注费用异常变化的原因分析
+2. 提供具体的成本优化建议
+3. 指出潜在的风险或需要注意的地方
+4. 回复简洁明了，3-5条要点即可
+5. 使用中文回复(英文的专业名词不用翻译，直接使用)"""
+
+            user_prompt = f"""请分析以下 AWS 账单数据：
+
+账单周期: {report_data['prev_month_name']} vs {report_data['last_month_name']}
+上月总费用: ${report_data['total_prev']:.2f}
+本月总费用: ${report_data['total_last']:.2f}
+费用变化: ${report_data['total_diff']:.2f} ({report_data['total_percent']:.2f}%)
+
+异常服务数量: {len(report_data['anomalies'])}
+
+详细日志：
+{log_content}
+
+请提供分析和建议："""
+        else:
+            system_prompt = """You are a professional cloud cost analysis expert. Please analyze the provided AWS bill logs and provide concise, valuable insights.
+
+Requirements:
+1. Focus on analyzing reasons for cost anomalies
+2. Provide specific cost optimization suggestions
+3. Point out potential risks or areas requiring attention
+4. Keep response concise with 3-5 key points
+5. Respond in English"""
+            
+            user_prompt = f"""Please analyze the following AWS bill data:
+
+Billing Period: {report_data['prev_month_name']} vs {report_data['last_month_name']}
+Previous Month Total: ${report_data['total_prev']:.2f}
+Last Month Total: ${report_data['total_last']:.2f}
+Cost Change: ${report_data['total_diff']:.2f} ({report_data['total_percent']:.2f}%)
+
+Number of Anomalies: {len(report_data['anomalies'])}
+
+Detailed Logs:
+{log_content}
+
+Please provide analysis and recommendations:"""
+        
+        # 调用 OpenAI API
+        logger.info("Calling OpenAI API for log analysis...")
+        response = client.chat.completions.create(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        analysis = response.choices[0].message.content.strip()
+        logger.info(f"AI analysis completed, tokens used: {response.usage.total_tokens}")
+        
+        return analysis
+        
+    except ImportError:
+        logger.warning("OpenAI library not installed. Install it with: pip install openai")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to analyze logs with AI: {e}", exc_info=True)
+        return None
 
 def send_feishu_notification(title, content, color="green"):
     """Send notification to Feishu via webhook using card message
@@ -384,7 +495,31 @@ def main():
     logger.info(f"{'TOTAL':<45} | {total_prev:<15.2f} | {total_last:<15.2f} | {total_diff:<15.2f} | {total_percent:<10.2f}%")
     logger.info("-" * 105)
 
-    # 5. 发送飞书通知（总览 + 异常项）
+    # 5. AI 分析日志（如果配置了 OpenAI API）
+    ai_analysis = None
+    if OPENAI_API_BASE and OPENAI_API_KEY:
+        # 获取收集的日志内容
+        log_content = log_stream.getvalue()
+        
+        # 准备报告数据
+        report_data = {
+            'prev_month_name': prev_month_name,
+            'last_month_name': last_month_name,
+            'total_prev': total_prev,
+            'total_last': total_last,
+            'total_diff': total_diff,
+            'total_percent': total_percent,
+            'anomalies': anomalies
+        }
+        
+        # 调用 AI 分析
+        ai_analysis = analyze_logs_with_ai(log_content, report_data)
+        
+        if ai_analysis:
+            logger.info("AI analysis result:")
+            logger.info(ai_analysis)
+    
+    # 6. 发送通知（总览 + 异常项 + AI 分析）
     if anomalies:
         # 有异常情况
         logger.warning(f"Found {len(anomalies)} anomaly/anomalies")
@@ -411,6 +546,12 @@ def main():
                 f"{get_text('service_change', currency=CURRENCY_SYMBOL, diff=anomaly['diff'], percent=anomaly['percent'])}"
             )
         
+        # 添加 AI 分析结果
+        if ai_analysis:
+            content_lines.append("")
+            content_lines.append("🤖 **AI 分析与建议**" if LANGUAGE == 'CN' else "🤖 **AI Analysis & Recommendations**")
+            content_lines.append(ai_analysis)
+        
         send_notification(
             title=get_text('anomaly_title'),
             content="\n".join(content_lines),
@@ -431,6 +572,12 @@ def main():
             get_text('no_anomalies'),
             get_text('threshold_info', currency=CURRENCY_SYMBOL, threshold_dollar=THRESHOLD_DOLLAR, threshold_percent=THRESHOLD_PERCENT)
         ]
+        
+        # 添加 AI 分析结果
+        if ai_analysis:
+            content_lines.append("")
+            content_lines.append("🤖 **AI 分析与建议**" if LANGUAGE == 'CN' else "🤖 **AI Analysis & Recommendations**")
+            content_lines.append(ai_analysis)
         
         send_notification(
             title=get_text('normal_title'),

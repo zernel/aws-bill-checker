@@ -6,6 +6,7 @@
 
 - 🔍 **自动对比分析**: 对比上个月和上上个月的 AWS 账单，按服务分类统计
 - 📊 **异常检测**: 自动识别费用异常增长的服务（金额或百分比阈值可配置）
+- 🤖 **AI 智能分析**: 使用 OpenAI API 分析账单日志，提供成本优化建议和异常原因分析（可选）
 - 🔔 **多平台通知**: 支持飞书和 Mattermost，使用卡片消息格式，清晰区分正常/异常状态
 - ⚙️ **灵活配置**: 通过 .env 文件配置所有参数（阈值、货币符号、Webhook 等）
 - 📝 **详细日志**: 记录完整的对比报告和执行日志
@@ -118,7 +119,18 @@ CURRENCY_SYMBOL=$                  # 通知中显示的货币符号 (默认: $�
 
 # 语言设置
 LANGUAGE=CN                        # 通知语言 (默认: CN，可选: CN, EN)
+
+# AI 分析配置（可选）
+OPENAI_API_BASE=https://api.openai.com/v1  # OpenAI API Base URL
+OPENAI_API_KEY=sk-xxxxxxxx                  # OpenAI API Key
 ```
+
+**AI 分析功能说明**:
+- 如果配置了 `OPENAI_API_BASE` 和 `OPENAI_API_KEY`，脚本会自动调用 AI 分析账单日志
+- AI 会分析费用变化原因并提供成本优化建议
+- 分析结果会自动附加到通知消息中
+- 如果不配置这两个参数，脚本会跳过 AI 分析，仍正常运行
+- 支持 OpenAI 兼容的 API（如 Azure OpenAI, 本地部署的模型等）
 
 #### 获取 Webhook URL
 
@@ -133,6 +145,18 @@ LANGUAGE=CN                        # 通知语言 (默认: CN，可选: CN, EN)
 3. 点击 "Add Incoming Webhook"
 4. 设置名称和描述，选择要发送到的频道
 5. 复制生成的 Webhook URL
+
+**获取 OpenAI API Key** (可选，用于 AI 分析功能):
+1. 访问 [OpenAI Platform](https://platform.openai.com/)
+2. 登录或注册账号
+3. 进入 API Keys 页面: https://platform.openai.com/api-keys
+4. 点击 "Create new secret key" 创建新的 API Key
+5. 复制并保存 API Key（只会显示一次）
+6. 将 API Key 填入 `.env` 文件的 `OPENAI_API_KEY` 字段
+
+**使用兼容 API**:
+- 如果使用 Azure OpenAI 或其他兼容 OpenAI API 的服务，修改 `OPENAI_API_BASE` 为对应的 API 地址即可
+- 例如：`OPENAI_API_BASE=https://your-resource.openai.azure.com/openai/deployments/your-deployment`
 
 ## Configuration Details
 
@@ -285,6 +309,11 @@ tail -f logs/aws_bill_checker_*.log
 
 ✅ 未发现明显异常增长的服务
    (阈值: $50 或 25%)
+
+🤖 AI 分析与建议
+1. 费用小幅下降主要来自于 EC2 实例优化和预留实例的生效
+2. 建议继续监控 S3 存储增长趋势，考虑启用生命周期策略
+3. Data Transfer 费用稳定，当前架构合理
 ```
 
 #### 异常情况
@@ -312,6 +341,12 @@ tail -f logs/aws_bill_checker_*.log
    - 2025-08: $100.00
    - 2025-09: $180.00
    - 变化: +$80.00 (+80.00%)
+
+🤖 AI 分析与建议
+1. EC2 费用激增可能是由于新增实例或实例类型升级，建议检查是否有未使用的实例
+2. S3 存储增长迅速，建议启用 S3 Intelligent-Tiering 和生命周期策略来优化成本
+3. 检查 CloudWatch 日志，确认是否有异常流量或数据传输
+4. 考虑购买 EC2 预留实例或 Savings Plans 以降低长期成本
 ```
 
 ### 英文通知 (LANGUAGE=EN)
@@ -332,6 +367,11 @@ tail -f logs/aws_bill_checker_*.log
 
 ✅ No significant cost increases detected
    (threshold: $50 or 25%)
+
+🤖 AI Analysis & Recommendations
+1. Slight decrease in costs mainly from EC2 instance optimization and Reserved Instances taking effect
+2. Recommend monitoring S3 storage growth trends and enabling lifecycle policies
+3. Data Transfer costs are stable, current architecture is reasonable
 ```
 
 #### 异常情况
