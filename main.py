@@ -175,7 +175,7 @@ Please provide analysis and recommendations:"""
         # 调用 OpenAI API
         logger.info("Calling OpenAI API for log analysis...")
         response = client.chat.completions.create(
-            model="gpt-4.1",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
