@@ -175,12 +175,12 @@ Please provide analysis and recommendations:"""
         # 调用 OpenAI API
         logger.info("Calling OpenAI API for log analysis...")
         response = client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5.2",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.7,
+            temperature=1,
             max_completion_tokens=1000
         )
         
