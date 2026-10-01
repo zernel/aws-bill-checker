@@ -32,6 +32,17 @@ MATTERMOST_WEBHOOK_URL = os.environ.get('MATTERMOST_WEBHOOK_URL', '')
 # OpenAI API Settings (从环境变量读取)
 OPENAI_API_BASE = os.environ.get('OPENAI_API_BASE', '')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.2')
+
+# Cost Explorer 端点区域：多部署共用本代码，kude 侧默认 us-east-1，
+# mp-cn 部署必须在 .env 里设置 CE_REGION=cn-north-1（中国区分区）
+CE_REGION = os.environ.get('CE_REGION', 'us-east-1')
+
+# 可选：显式 AWS profile（默认走 default 凭证链）
+AWS_PROFILE = os.environ.get('AWS_PROFILE', '').strip() or None
+
+# DRY_RUN=1 时通知只打印不发送（用于两套部署的测试，不打扰真实频道）
+DRY_RUN = os.environ.get('DRY_RUN', '').strip().lower() in ('1', 'true', 'yes')
 
 # 日志配置
 LOG_DIR = Path(__file__).parent / 'logs'
@@ -68,7 +79,10 @@ LANG_STRINGS = {
         'anomalies_found': '**⚠️ 发现 {count} 个异常项** (阈值: {currency}{threshold_dollar} 或 {threshold_percent}%):',
         'no_anomalies': '✅ **未发现明显异常增长的服务**',
         'threshold_info': '   (阈值: {currency}{threshold_dollar} 或 {threshold_percent}%)',
-        'service_change': '   - 变化: {currency}{diff:+,.2f} ({percent:+.2f}%)'
+        'service_change': '   - 变化: {currency}{diff:+,.2f} ({percent:+.2f}%)',
+        'usage_type_detail': '   - UsageType 明细 (Top 增长项):',
+        'usage_type_line': '     - {usage_type}: {currency}{diff:+,.2f} ({currency}{prev:,.2f} → {currency}{last:,.2f})',
+        'data_delay_note': '> 注: Cost Explorer 数据有 24-48 小时延迟，上月末 1-2 天费用可能未计入。'
     },
     'EN': {
         'error_title': '❌ AWS Bill Check Failed',
@@ -83,7 +97,10 @@ LANG_STRINGS = {
         'anomalies_found': '**⚠️ Found {count} anomaly/anomalies** (threshold: {currency}{threshold_dollar} or {threshold_percent}%):',
         'no_anomalies': '✅ **No significant cost increases detected**',
         'threshold_info': '   (threshold: {currency}{threshold_dollar} or {threshold_percent}%)',
-        'service_change': '   - Change: {currency}{diff:+,.2f} ({percent:+.2f}%)'
+        'service_change': '   - Change: {currency}{diff:+,.2f} ({percent:+.2f}%)',
+        'usage_type_detail': '   - UsageType breakdown (top increases):',
+        'usage_type_line': '     - {usage_type}: {currency}{diff:+,.2f} ({currency}{prev:,.2f} → {currency}{last:,.2f})',
+        'data_delay_note': '> Note: Cost Explorer data lags 24-48h; charges from the last 1-2 days of the month may not be included.'
     }
 }
 
@@ -144,6 +161,9 @@ def analyze_logs_with_ai(log_content, report_data):
 
 异常服务数量: {len(report_data['anomalies'])}
 
+异常服务 UsageType 下钻明细:
+{report_data.get('drilldown_text', 'N/A')}
+
 详细日志：
 {log_content}
 
@@ -167,6 +187,9 @@ Cost Change: ${report_data['total_diff']:.2f} ({report_data['total_percent']:.2f
 
 Number of Anomalies: {len(report_data['anomalies'])}
 
+UsageType drill-down for anomalous services:
+{report_data.get('drilldown_text', 'N/A')}
+
 Detailed Logs:
 {log_content}
 
@@ -175,7 +198,7 @@ Please provide analysis and recommendations:"""
         # 调用 OpenAI API
         logger.info("Calling OpenAI API for log analysis...")
         response = client.chat.completions.create(
-            model="gpt-5.2",
+            model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -315,15 +338,20 @@ def send_mattermost_notification(title, content, color="good"):
 
 def send_notification(title, content, color="green"):
     """Send notification to configured platforms (Feishu and/or Mattermost)
-    
+
     Args:
         title: Message title
         content: Message content
         color: Color indicator - "green" for normal, "red" for error, "orange" for warning
-    
+
     Returns:
         bool: True if at least one notification was sent successfully
     """
+    if DRY_RUN:
+        logger.info(f"[DRY_RUN] notification suppressed. title={title} color={color}")
+        logger.info("[DRY_RUN] content:\n" + content)
+        return True
+
     if not FEISHU_WEBHOOK_URL and not MATTERMOST_WEBHOOK_URL:
         logger.warning("No notification webhook configured (FEISHU_WEBHOOK_URL or MATTERMOST_WEBHOOK_URL)")
         return False
@@ -342,9 +370,16 @@ def send_notification(title, content, color="green"):
     
     return success
 
+def get_ce_client():
+    """创建 Cost Explorer 客户端（端点区域与 profile 可配置，兼容多部署分区）"""
+    session_kwargs = {}
+    if AWS_PROFILE:
+        session_kwargs['profile_name'] = AWS_PROFILE
+    return boto3.Session(**session_kwargs).client('ce', region_name=CE_REGION)
+
 def get_monthly_costs(start_date, end_date):
     """使用 Cost Explorer API 查询指定时间段内按服务分类的成本"""
-    client = boto3.client('ce')
+    client = get_ce_client()
     try:
         response = client.get_cost_and_usage(
             TimePeriod={
@@ -359,6 +394,57 @@ def get_monthly_costs(start_date, end_date):
     except Exception as e:
         logger.error(f"Failed to call AWS Cost Explorer API: {e}", exc_info=True)
         return None
+
+def get_usage_type_costs(service_name, start_date, end_date):
+    """查询指定服务在时间段内按 USAGE_TYPE 分类的成本（异常下钻用）"""
+    client = get_ce_client()
+    response = client.get_cost_and_usage(
+        TimePeriod={'Start': start_date, 'End': end_date},
+        Granularity='MONTHLY',
+        Metrics=['UnblendedCost'],
+        GroupBy=[{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}],
+        Filter={'Dimensions': {'Key': 'SERVICE', 'Values': [service_name]}}
+    )
+    costs = {}
+    for group in (response.get('ResultsByTime') or [{}])[0].get('Groups', []):
+        costs[group['Keys'][0]] = float(group['Metrics']['UnblendedCost']['Amount'])
+    return costs
+
+def drill_down_anomalies(anomalies, prev_month_start, prev_month_end, last_month_start, last_month_end, top_n=5):
+    """对异常服务按 USAGE_TYPE 下钻，找出涨幅最大的细项写入 anomaly['usage_types']"""
+    for anomaly in anomalies:
+        service = anomaly['service']
+        try:
+            prev = get_usage_type_costs(service, prev_month_start, prev_month_end)
+            last = get_usage_type_costs(service, last_month_start, last_month_end)
+        except Exception as e:
+            logger.warning(f"UsageType drill-down failed for {service}: {e}")
+            anomaly['usage_types'] = None
+            continue
+        items = []
+        for usage_type in set(prev) | set(last):
+            p, l = prev.get(usage_type, 0.0), last.get(usage_type, 0.0)
+            if l - p > 0.5:
+                items.append({'usage_type': usage_type, 'prev': p, 'last': l, 'diff': l - p})
+        items.sort(key=lambda x: -x['diff'])
+        anomaly['usage_types'] = items[:top_n]
+        if anomaly['usage_types']:
+            logger.info(f"UsageType drill-down for {service}:")
+            for item in anomaly['usage_types']:
+                logger.info(f"  - {item['usage_type']}: {item['diff']:+.2f} ({item['prev']:.2f} -> {item['last']:.2f})")
+    return anomalies
+
+def build_drilldown_text(anomalies):
+    """把异常服务的 UsageType 下钻结果整理为文本，供 AI prompt 使用"""
+    sections = []
+    for anomaly in anomalies:
+        if anomaly.get('usage_types'):
+            lines = "\n".join(
+                f"  - {u['usage_type']}: {u['diff']:+.2f} ({u['prev']:.2f} -> {u['last']:.2f})"
+                for u in anomaly['usage_types']
+            )
+            sections.append(f"{anomaly['service']}:\n{lines}")
+    return "\n".join(sections) if sections else "N/A"
 
 def parse_costs_to_dict(response):
     """将 Cost Explorer 的 API 响应解析为 {服务名: 金额} 的字典"""
@@ -472,6 +558,15 @@ def main():
                 'percent': percent
             })
 
+    # 对异常服务按 UsageType 下钻（AI 分析与通知都会用到）
+    if anomalies:
+        logger.info(f"Drilling down {len(anomalies)} anomalous service(s) by UsageType...")
+        drill_down_anomalies(
+            anomalies,
+            prev_month_start, prev_month_end,
+            last_month_start, last_month_end
+        )
+
     # 4. 记录详细报告到日志
     logger.info("-" * 105)
     logger.info(f"AWS Bill Comparison Report: {prev_month_name} vs {last_month_name}")
@@ -509,7 +604,8 @@ def main():
             'total_last': total_last,
             'total_diff': total_diff,
             'total_percent': total_percent,
-            'anomalies': anomalies
+            'anomalies': anomalies,
+            'drilldown_text': build_drilldown_text(anomalies)
         }
         
         # 调用 AI 分析
@@ -539,19 +635,31 @@ def main():
         ]
         
         for anomaly in anomalies:
-            content_lines.append(
+            block = (
                 f"🔸 **{anomaly['service']}**\n"
                 f"   - {prev_month_name}: {CURRENCY_SYMBOL}{anomaly['prev']:,.2f}\n"
                 f"   - {last_month_name}: {CURRENCY_SYMBOL}{anomaly['last']:,.2f}\n"
                 f"{get_text('service_change', currency=CURRENCY_SYMBOL, diff=anomaly['diff'], percent=anomaly['percent'])}"
             )
-        
+            if anomaly.get('usage_types'):
+                block += "\n" + get_text('usage_type_detail')
+                for item in anomaly['usage_types']:
+                    block += "\n" + get_text(
+                        'usage_type_line',
+                        usage_type=item['usage_type'], currency=CURRENCY_SYMBOL,
+                        diff=item['diff'], prev=item['prev'], last=item['last']
+                    )
+            content_lines.append(block)
+
         # 添加 AI 分析结果
         if ai_analysis:
             content_lines.append("")
             content_lines.append("🤖 **AI 分析与建议**" if LANGUAGE == 'CN' else "🤖 **AI Analysis & Recommendations**")
             content_lines.append(ai_analysis)
-        
+
+        content_lines.append("")
+        content_lines.append(get_text('data_delay_note'))
+
         send_notification(
             title=get_text('anomaly_title'),
             content="\n".join(content_lines),
@@ -578,7 +686,10 @@ def main():
             content_lines.append("")
             content_lines.append("🤖 **AI 分析与建议**" if LANGUAGE == 'CN' else "🤖 **AI Analysis & Recommendations**")
             content_lines.append(ai_analysis)
-        
+
+        content_lines.append("")
+        content_lines.append(get_text('data_delay_note'))
+
         send_notification(
             title=get_text('normal_title'),
             content="\n".join(content_lines),
